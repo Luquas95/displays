@@ -56,3 +56,7 @@ Every applied change is written to `~/.local/state/omarchy/displays/monitors.con
 ## Why not just edit monitors.conf by hand?
 
 You can, but you're guessing coordinates and scale values that Hyprland will silently adjust if they don't divide evenly into whole pixels. `displays` reads the real state back from `hyprctl`, computes positions itself so the layout is always anchored with no gaps, and snaps scale to a value Hyprland will actually keep — all with instant visual feedback instead of a reload-and-check loop.
+
+## Contributors
+
+- [Luquas95](https://github.com/Luquas95) — creator & maintainer
