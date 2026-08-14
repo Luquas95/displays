@@ -51,7 +51,7 @@ displays
 
 ## How persistence works
 
-Every applied change is written to `~/.local/state/omarchy/displays/monitors.conf`, which `hyprland.conf` sources right after `~/.config/hypr/monitors.conf`. That means your last choice always wins on the next Hyprland start — without it, reconnecting a monitor falls back to the static default rule (typically "place it to the right"), no matter what you had set before.
+Every applied change is written to `~/.local/state/omarchy/displays/monitors.conf`. On its first run, `displays` wires that file into `~/.config/hypr/hyprland.conf` for you — right after the existing `source = ~/.config/hypr/monitors.conf` line, so it takes priority — and backs up `hyprland.conf` beforehand (`hyprland.conf.bak.<timestamp>`). No manual config editing needed, even on a fresh machine. That means your last choice always wins on the next Hyprland start — without it, reconnecting a monitor falls back to the static default rule (typically "place it to the right"), no matter what you had set before.
 
 ## Why not just edit monitors.conf by hand?
 

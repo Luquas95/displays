@@ -41,6 +41,36 @@ mkdir -p "$STATE_DIR"
 
 declare -A PERSIST_MAP   # jmeno monitoru -> radek pravidla naposled odeslany hyprctl
 
+# Zadrati soubor s ulozenym layoutem do ~/.config/hypr/hyprland.conf, pokud
+# tam jeste neni (typicky prvni spusteni na novem stroji). Bez tohoto radku
+# by se STATE_FILE sice zapisoval, ale Hyprland by ho nikdy nenacetl a
+# ulozeny layout by se po restartu ztratil - presne bug, kvuli kteremu tahle
+# perzistence vznikla. Idempotentni, se zalohou puvodniho souboru.
+ensure_persistence_wired() {
+  local hypr_conf="$HOME/.config/hypr/hyprland.conf"
+  local state_rel="~/.local/state/omarchy/displays/monitors.conf"
+  local anchor='source = ~/.config/hypr/monitors.conf'
+  local src_line="source = $state_rel"
+
+  [[ -f $hypr_conf ]] || return   # zadny Hyprland config tady - neni co delat
+  grep -qF "$state_rel" "$hypr_conf" && return   # uz zadratovano
+
+  cp "$hypr_conf" "$hypr_conf.bak.$(date +%s)"
+
+  if grep -qF "$anchor" "$hypr_conf"; then
+    # Vlozit hned za monitors.conf, aby ulozeny layout mel prednost pred
+    # vychozimi pravidly (pozdejsi 'source' pro stejny monitor vyhrava).
+    awk -v anchor="$anchor" -v src="$src_line" \
+      '{ print } index($0, anchor) { print src }' \
+      "$hypr_conf" > "$hypr_conf.tmp" && mv "$hypr_conf.tmp" "$hypr_conf"
+  else
+    printf '\n# Ulozeny layout z programu "displays"\n%s\n' "$src_line" >> "$hypr_conf"
+  fi
+
+  hyprctl reload >/dev/null 2>&1
+  NOTE="Prvni spusteni: do hyprland.conf pridan radek pro ukladani layoutu (zaloha: $(basename "$hypr_conf").bak.*)"
+}
+
 # --- detekce monitoru ---------------------------------------------------------
 # Fyzicky pripojene konektory podle jadra (autoritativni zdroj).
 # card1-HDMI-A-2 -> HDMI-A-2
@@ -413,21 +443,21 @@ draw() {
   clear
   local mm em ar al au ad ow oi oe res t rot label want
 
-  if [[ $MODE == mirror ]]; then mm=$'[\033[91mX\033[0m]'; em="[ ]"; else mm="[ ]"; em=$'[\033[91mX\033[0m]'; fi
+  if [[ $MODE == mirror ]]; then mm=$'[\033[38;2;255;0;0mX\033[0m]'; em="[ ]"; else mm="[ ]"; em=$'[\033[38;2;255;0;0mX\033[0m]'; fi
   ar=" "; al=" "; au=" "; ad=" "
   if [[ $MODE == extend ]]; then
     case "$DIR" in
-      right) ar=$'\033[91m*\033[0m' ;;
-      left)  al=$'\033[91m*\033[0m' ;;
-      up)    au=$'\033[91m*\033[0m' ;;
-      down)  ad=$'\033[91m*\033[0m' ;;
+      right) ar=$'\033[38;2;255;0;0m*\033[0m' ;;
+      left)  al=$'\033[38;2;255;0;0m*\033[0m' ;;
+      up)    au=$'\033[38;2;255;0;0m*\033[0m' ;;
+      down)  ad=$'\033[38;2;255;0;0m*\033[0m' ;;
     esac
   fi
   ow=" "; oi=" "; oe=" "
   case "$OUTPUT" in
-    both)     ow=$'\033[91m*\033[0m' ;;
-    internal) oi=$'\033[91m*\033[0m' ;;
-    external) oe=$'\033[91m*\033[0m' ;;
+    both)     ow=$'\033[38;2;255;0;0m*\033[0m' ;;
+    internal) oi=$'\033[38;2;255;0;0m*\033[0m' ;;
+    external) oe=$'\033[38;2;255;0;0m*\033[0m' ;;
   esac
 
   res=$(mon_prop "$EXTERNAL" width)x$(mon_prop "$EXTERNAL" height)
@@ -501,6 +531,7 @@ if [[ -z $EXTERNAL ]]; then
 fi
 
 read_state
+ensure_persistence_wired
 
 cleanup() { printf '\033[?25h'; clear; }
 trap cleanup EXIT
