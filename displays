@@ -1,0 +1,546 @@
+#!/usr/bin/env bash
+# displays - TUI sprava externich monitoru pro Hyprland
+#
+#   Tab      rezim        Mirror <-> Extend
+#   Sipky    v Extend     strana externiho monitoru (vlevo/vpravo/nahore/dole)
+#   s        skalovani externiho monitoru (1 / 1.25 / 1.5 / 2)
+#   o        ktere obrazovky sviti (oba / jen notebook / jen externi)
+#   e        prepnout na dalsi externi monitor (kdyz jich je vic)
+#   r        reset na vychozi rozlozeni z ~/.config/hypr/monitors.conf
+#            (zapomene ulozeny stav popsany nize)
+#   q        konec
+#
+# Zmeny se aplikuji az na stisk klavesy - pouhe spusteni programu
+# nic neprepina.
+#
+# Kazde uspesne "apply" se zaroven uklada do
+# ~/.local/state/omarchy/displays/monitors.conf, ktery hyprland.conf
+# nacita hned po ~/.config/hypr/monitors.conf. Diky tomu posledni zvoleny
+# layout (mirror/extend, strana, scale, zapnute/vypnute obrazovky) prezije
+# restart Hyprlandu i odpojeni notebooku - jinak by se pri kazdem startu
+# pouzila jen vychozi pravidla (externi monitor "auto" = vpravo).
+
+set -uo pipefail
+
+command -v hyprctl >/dev/null || { echo "hyprctl nenalezen - vyzaduje Hyprland."; exit 1; }
+command -v jq >/dev/null || { echo "jq nenalezen - potreba pro cteni vystupu hyprctl."; exit 1; }
+
+SCALES=(1 1.25 1.5 2)
+SCALE_IDX=0     # co si preje uzivatel (index do SCALES)
+ESCALE=1        # co doopravdy jede na externim monitoru (viz snap_scale)
+ISCALE=1        # totez pro interni panel
+STATUS=""       # chyba (cervene)
+NOTE=""         # informace (zlute)
+
+# Kam se uklada posledni odeslany layout, aby prezil restart Hyprlandu
+# (viz komentar na zacatku souboru a persist_layout nize).
+STATE_DIR="$HOME/.local/state/omarchy/displays"
+STATE_FILE="$STATE_DIR/monitors.conf"
+mkdir -p "$STATE_DIR"
+[[ -f $STATE_FILE ]] || : > "$STATE_FILE"
+
+declare -A PERSIST_MAP   # jmeno monitoru -> radek pravidla naposled odeslany hyprctl
+
+# --- detekce monitoru ---------------------------------------------------------
+# Fyzicky pripojene konektory podle jadra (autoritativni zdroj).
+# card1-HDMI-A-2 -> HDMI-A-2
+connected_outputs() {
+  local d name
+  for d in /sys/class/drm/card*-*/; do
+    [[ -r "${d}status" ]] || continue
+    [[ $(< "${d}status") == connected ]] || continue
+    name=$(basename "$d")
+    printf '%s\n' "${name#card*-}"
+  done
+}
+
+# Seznam obrazovek, se kterymi se da pracovat.
+#
+# `hyprctl monitors` sam nestaci: zrcadleny nebo vypnuty vystup v nem
+# vubec neni (zmizel by uprostred prace). `monitors all` zase vraci i
+# konektory, ktere uz nejsou zapojene. Bereme tedy prunik obou -
+# vystupy, ktere Hyprland zna A ktere jsou skutecne pripojene.
+#
+# Interni panel = eDP-*/LVDS-*/DSI-*, vse ostatni je externi. Zadny port
+# neni natvrdo, funguje DP, HDMI i USB-C dok.
+detect_monitors() {
+  local known drm candidates n d found
+  mapfile -t known < <(hyprctl monitors all -j 2>/dev/null | jq -r '.[].name')
+  mapfile -t drm   < <(connected_outputs)
+
+  candidates=()
+  if (( ${#drm[@]} > 0 )); then
+    for n in "${known[@]:-}"; do
+      [[ -z $n ]] && continue
+      found=0
+      for d in "${drm[@]}"; do
+        [[ $n == "$d" ]] && { found=1; break; }
+      done
+      (( found )) && candidates+=("$n")
+    done
+  fi
+  # /sys/class/drm nedostupne (jina grafika, VM) -> spolehni se na Hyprland
+  (( ${#candidates[@]} == 0 )) && candidates=("${known[@]:-}")
+
+  INTERNAL=""
+  EXTERNALS=()
+  for n in "${candidates[@]:-}"; do
+    [[ -z $n ]] && continue
+    case "$n" in
+      eDP-*|LVDS-*|DSI-*) if [[ -z $INTERNAL ]]; then INTERNAL="$n"; else EXTERNALS+=("$n"); fi ;;
+      *)                  EXTERNALS+=("$n") ;;
+    esac
+  done
+
+  # Zadny interni panel (stolni pocitac, neznamy nazev panelu): za "hlavni"
+  # obrazovku vezmeme prvni nalezenou. Bez toho by INTERNAL zustalo prazdne
+  # a pravidlo `monitor = , ...` je pro Hyprland WILDCARD pro vsechny
+  # monitory - prepsalo by naraz celou konfiguraci.
+  HAS_INTERNAL=1
+  if [[ -z $INTERNAL ]] && (( ${#EXTERNALS[@]} > 0 )); then
+    HAS_INTERNAL=0
+    INTERNAL="${EXTERNALS[0]}"
+    EXTERNALS=("${EXTERNALS[@]:1}")
+  fi
+
+  EXT_IDX=${EXT_IDX:-0}
+  (( EXT_IDX >= ${#EXTERNALS[@]} )) && EXT_IDX=0
+  EXTERNAL="${EXTERNALS[$EXT_IDX]:-}"
+}
+
+# Vlastnost monitoru z hyprctl (i kdyz je prave vypnuty).
+mon_prop() {
+  [[ -z ${1:-} ]] && return
+  # Pozn.: `// empty` zde nelze - v jq je `false` falsy a hodnota
+  # .disabled == false by se ztratila.
+  hyprctl monitors all -j 2>/dev/null |
+    jq -r --arg m "$1" --arg p "$2" '.[] | select(.name==$m) | .[$p] | select(. != null)'
+}
+
+# 2.00 -> 2, 1.250 -> 1.25 (Hyprland vraci scale s desetinami nulami)
+fmt_scale() {
+  [[ -z ${1:-} ]] && return
+  awk -v s="$1" 'BEGIN { printf (s == int(s)) ? "%d\n" : "%g\n", s }'
+}
+
+cur_scale() {
+  local s
+  s=$(fmt_scale "$(mon_prop "$1" scale)")
+  printf '%s\n' "${s:-1}"
+}
+
+# Rozmery panelu s ohledem na rotaci.
+#
+# hyprctl hlasi width/height VZDY netransformovane - u monitoru na vysku
+# (transform 1/3/5/7 = 90/270 stupnu, pripadne prevracene) tedy vrati
+# 1920x1080, i kdyz plocha je ve skutecnosti 1080x1920. Prohodime sami.
+oriented_size() {
+  local name="$1" w h t
+  w=$(mon_prop "$name" width); h=$(mon_prop "$name" height)
+  t=$(mon_prop "$name" transform); t=${t:-0}
+  if [[ -z $w || -z $h ]]; then echo "0 0"; return; fi
+  if (( t % 2 == 1 )); then echo "$h $w"; else echo "$w $h"; fi
+}
+
+# Logicky rozmer = pixely / scale (to je to, co vidi layout).
+logical_size() {
+  local name="$1" scale="$2" w h
+  read -r w h < <(oriented_size "$name")
+  (( w == 0 )) && { echo "0 0"; return; }
+  awk -v w="$w" -v h="$h" -v s="$scale" 'BEGIN { printf "%d %d\n", int(w/s+0.5), int(h/s+0.5) }'
+}
+
+# Nejblizsi skalovani, ktere Hyprland na danem monitoru skutecne prijme.
+#
+# Hyprland vyzaduje, aby rozliseni deleno scale vyslo na cele pixely. Kdyz
+# nevyjde (napr. 2560x1440 pri 1.5), hodnotu si POTICHU upravi a `hyprctl
+# keyword` presto vrati "ok" - pozice sousedniho monitoru pocitane z puvodni
+# hodnoty pak nesedi a v layoutu zustane mezera nebo prekryv. Hledame proto
+# pouzitelnou hodnotu sami, po krocich 1/120 (granularita wayland scale),
+# a smerem nahoru driv nez dolu - stejne jako to dela Hyprland.
+snap_scale() {
+  local name="$1" want="$2" w h
+  read -r w h < <(oriented_size "$name")
+  if (( w == 0 )); then printf '%s\n' "$want"; return; fi
+  awk -v w="$w" -v h="$h" -v want="$want" '
+    function ok(s,   a, b) {
+      if (s <= 0) return 0
+      a = w/s; b = h/s
+      return (a - int(a+0.5) < 0.001 && int(a+0.5) - a < 0.001 &&
+              b - int(b+0.5) < 0.001 && int(b+0.5) - b < 0.001)
+    }
+    BEGIN {
+      base = int(want*120 + 0.5)
+      s = 0
+      if (ok(base/120)) s = base/120
+      for (i = 1; i <= 240 && s == 0; i++) {
+        if      (ok((base+i)/120)) s = (base+i)/120
+        else if (base-i > 0 && ok((base-i)/120)) s = (base-i)/120
+      }
+      if (s == 0) s = want
+      printf (s == int(s)) ? "%d\n" : "%g\n", s
+    }'
+}
+
+# Index nejblizsi nabizene hodnoty v SCALES.
+nearest_scale_idx() {
+  local target="$1" best
+  best=$(awk -v t="$target" -v list="${SCALES[*]}" '
+    BEGIN {
+      n = split(list, a, " ")
+      bi = 0; bd = 1e9
+      for (i = 1; i <= n; i++) { d = (a[i] > t) ? a[i]-t : t-a[i]; if (d < bd) { bd = d; bi = i-1 } }
+      print bi
+    }')
+  printf '%s\n' "$best"
+}
+
+# --- nacteni aktualniho stavu (bez zasahu do konfigurace) ---------------------
+read_state() {
+  MODE="extend"; DIR="right"; OUTPUT="both"
+
+  local ext_disabled int_disabled mirror_of s ex ey ix iy
+  ext_disabled=$(mon_prop "$EXTERNAL" disabled)
+  int_disabled=$(mon_prop "$INTERNAL" disabled)
+
+  if [[ $ext_disabled == true ]]; then
+    OUTPUT="internal"
+  elif [[ $int_disabled == true ]]; then
+    OUTPUT="external"
+  fi
+
+  mirror_of=$(mon_prop "$EXTERNAL" mirrorOf)
+  [[ -n $mirror_of && $mirror_of != none ]] && MODE="mirror"
+
+  ISCALE=$(cur_scale "$INTERNAL")
+  s=$(fmt_scale "$(mon_prop "$EXTERNAL" scale)")
+  if [[ -n $s ]]; then
+    ESCALE="$s"
+    SCALE_IDX=$(nearest_scale_idx "$s")
+  fi
+
+  # Strana odvozena z aktualnich souradnic.
+  if [[ $MODE == extend && $OUTPUT == both ]]; then
+    ex=$(mon_prop "$EXTERNAL" x); ey=$(mon_prop "$EXTERNAL" y)
+    ix=$(mon_prop "$INTERNAL" x); iy=$(mon_prop "$INTERNAL" y)
+    if [[ -n $ex && -n $ix ]]; then
+      if   (( ex >= ix )) && (( ${ey:-0} == ${iy:-0} )); then DIR="right"
+      elif (( ex <  ix )) && (( ${ey:-0} == ${iy:-0} )); then DIR="left"
+      elif (( ${ey:-0} <  ${iy:-0} ));                   then DIR="up"
+      else                                                    DIR="down"
+      fi
+    fi
+  fi
+}
+
+# --- aplikace nastaveni -------------------------------------------------------
+hypr() {
+  local out
+  if out=$(hyprctl keyword "$@" 2>&1); then
+    [[ $out == ok ]] || STATUS="$out"
+  else
+    STATUS="chyba: $out"
+  fi
+}
+
+# Jedno pravidlo pro jeden monitor. Prazdne jmeno je v Hyprlandu wildcard
+# pro vsechny monitory - nikdy ho neposilat.
+hypr_mon() {
+  local name="$1" rest="$2"
+  [[ -z $name ]] && { STATUS="interni chyba: prazdne jmeno monitoru"; return 1; }
+  hypr monitor "$name, $rest"
+  PERSIST_MAP["$name"]="$rest"
+}
+
+# Zapise naposledy odeslany layout (viz PERSIST_MAP naplneny pres hypr_mon)
+# do STATE_FILE, ktery hyprland.conf nacita hned po ~/.config/hypr/monitors.conf.
+# Volat az PO push_layout, aby soubor odpovidal tomu, co skutecne bezi.
+persist_layout() {
+  local name
+  {
+    printf '# Autogenerovano programem "displays" - needit rucne.\n'
+    printf '# Posledni rozlozeni monitoru zvolene v TUI. Klavesa "r" v displays\n'
+    printf '# tento soubor vyprazdni a vrati layout na ~/.config/hypr/monitors.conf.\n'
+    for name in "${!PERSIST_MAP[@]}"; do
+      printf 'monitor = %s, %s\n' "$name" "${PERSIST_MAP[$name]}"
+    done
+  } > "$STATE_FILE"
+}
+
+# Umisti monitor a zachova jeho rotaci. Pravidlo bez `transform` znamena
+# transform 0, takze bez tohoto by kazdy stisk klavesy narovnal monitor
+# postaveny na vysku.
+place() {
+  local name="$1" x="$2" y="$3" s="$4" t
+  t=$(mon_prop "$name" transform); t=${t:-0}
+  hypr_mon "$name" "preferred, ${x}x${y}, $s, transform, $t"
+}
+
+mirror_to() {
+  local name="$1" src="$2" s="$3" t
+  t=$(mon_prop "$name" transform); t=${t:-0}
+  hypr_mon "$name" "preferred, auto, $s, mirror, $src, transform, $t"
+}
+
+# Posle cely layout podle aktualniho OUTPUT/MODE/DIR. Pracuje s globalnimi
+# ISCALE/ESCALE, ktere uz jsou snapnute na hodnoty prijatelne pro Hyprland.
+push_layout() {
+  local iw ih ew eh ow oh os edge n
+
+  PERSIST_MAP=()   # vzdy odrazi jen posledni volani, ne soucet napric apply()
+
+  case "$OUTPUT" in
+    internal)
+      place "$INTERNAL" 0 0 "$ISCALE"
+      for n in "${EXTERNALS[@]:-}"; do
+        [[ -n $n ]] && hypr_mon "$n" "disable"
+      done
+      return ;;
+    external)
+      place "$EXTERNAL" 0 0 "$ESCALE"
+      hypr_mon "$INTERNAL" "disable"
+      for n in "${EXTERNALS[@]:-}"; do
+        [[ -n $n && $n != "$EXTERNAL" ]] && hypr_mon "$n" "disable"
+      done
+      return ;;
+  esac
+
+  # OUTPUT=both -> vse zapnout
+  if [[ $MODE == mirror ]]; then
+    place "$INTERNAL" 0 0 "$ISCALE"
+    for n in "${EXTERNALS[@]:-}"; do
+      [[ -z $n ]] && continue
+      if [[ $n == "$EXTERNAL" ]]; then
+        mirror_to "$n" "$INTERNAL" "$ESCALE"
+      else
+        mirror_to "$n" "$INTERNAL" "$(snap_scale "$n" "$(cur_scale "$n")")"
+      fi
+    done
+    return
+  fi
+
+  # Extend: obe pozice pocitame sami a ukotvime layout na 0x0. Puvodni
+  # verze pouzivala auto-left/auto-right, coz po nekolika prepnutich
+  # nechavalo layout posunuty od nuly s prazdnou mezerou.
+  read -r iw ih < <(logical_size "$INTERNAL" "$ISCALE")
+  read -r ew eh < <(logical_size "$EXTERNAL" "$ESCALE")
+
+  case "$DIR" in
+    right) place "$INTERNAL" 0 0 "$ISCALE"
+           place "$EXTERNAL" "$iw" 0 "$ESCALE"
+           edge=$(( iw + ew )) ;;
+    left)  place "$EXTERNAL" 0 0 "$ESCALE"
+           place "$INTERNAL" "$ew" 0 "$ISCALE"
+           edge=$(( ew + iw )) ;;
+    up)    place "$EXTERNAL" 0 0 "$ESCALE"
+           place "$INTERNAL" 0 "$eh" "$ISCALE"
+           edge=$(( ew > iw ? ew : iw )) ;;
+    down)  place "$INTERNAL" 0 0 "$ISCALE"
+           place "$EXTERNAL" 0 "$ih" "$ESCALE"
+           edge=$(( ew > iw ? ew : iw )) ;;
+  esac
+
+  # Dalsi externi monitory (dok se dvema obrazovkami) naskladame za pravy
+  # okraj layoutu. Drive dostaval pravidlo jen prave editovany monitor a
+  # ostatni zustavaly na starych souradnicich, kde se prekryvaly.
+  for n in "${EXTERNALS[@]:-}"; do
+    [[ -z $n || $n == "$EXTERNAL" ]] && continue
+    os=$(snap_scale "$n" "$(cur_scale "$n")")
+    read -r ow oh < <(logical_size "$n" "$os")
+    place "$n" "$edge" 0 "$os"
+    edge=$(( edge + ow ))
+  done
+}
+
+# Pocka, az se na monitoru projevi ocekavane skalovani (Hyprland meni rezim
+# asynchronne). Vrati nenulu, kdyz se do ~0.6 s neshoduje.
+settle() {
+  local i
+  for i in 1 2 3 4 5 6; do
+    sleep 0.1
+    [[ $(cur_scale "$1") == "$2" ]] && return 0
+  done
+  return 1
+}
+
+apply() {
+  STATUS=""; NOTE=""
+  if [[ -z $INTERNAL || -z $EXTERNAL ]]; then
+    STATUS="chybi monitor - stisknete r"
+    return
+  fi
+
+  local want="${SCALES[$SCALE_IDX]}"
+  ISCALE=$(snap_scale "$INTERNAL" "$(cur_scale "$INTERNAL")")
+  ESCALE=$(snap_scale "$EXTERNAL" "$want")
+
+  push_layout
+
+  # Pojistka pro pripad, ze by si Hyprland scale presto upravil (jina verze,
+  # jina heuristika): precteme skutecny stav a layout posleme jeste jednou,
+  # uz se spravnymi cisly.
+  if [[ $OUTPUT != internal ]] && ! settle "$EXTERNAL" "$ESCALE"; then
+    ESCALE=$(cur_scale "$EXTERNAL")
+    ISCALE=$(cur_scale "$INTERNAL")
+    push_layout
+  fi
+
+  persist_layout
+
+  if [[ $OUTPUT != internal && $ESCALE != "$want" ]]; then
+    NOTE="Skalovani ${want}x nelze na tomto rozliseni - pouzito ${ESCALE}x"
+  fi
+}
+
+reload_config() {
+  STATUS=""; NOTE=""
+  local out
+  # Zapomenout ulozeny layout - jinak by ho hyprland.conf hned zase nacetl
+  # a "r" by fakticky nic neresetovalo.
+  printf '# Autogenerovano programem "displays" - needit rucne.\n' > "$STATE_FILE"
+  out=$(hyprctl reload 2>&1) || STATUS="chyba: $out"
+  detect_monitors
+  read_state
+  [[ -z $STATUS ]] && NOTE="Nacteno z ~/.config/hypr/monitors.conf (ulozeny stav zapomenut)"
+}
+
+cycle_scale() {
+  SCALE_IDX=$(( (SCALE_IDX + 1) % ${#SCALES[@]} ))
+}
+
+# --- vykresleni ---------------------------------------------------------------
+draw() {
+  clear
+  local mm em ar al au ad ow oi oe res t rot label want
+
+  if [[ $MODE == mirror ]]; then mm=$'[\033[91mX\033[0m]'; em="[ ]"; else mm="[ ]"; em=$'[\033[91mX\033[0m]'; fi
+  ar=" "; al=" "; au=" "; ad=" "
+  if [[ $MODE == extend ]]; then
+    case "$DIR" in
+      right) ar=$'\033[91m*\033[0m' ;;
+      left)  al=$'\033[91m*\033[0m' ;;
+      up)    au=$'\033[91m*\033[0m' ;;
+      down)  ad=$'\033[91m*\033[0m' ;;
+    esac
+  fi
+  ow=" "; oi=" "; oe=" "
+  case "$OUTPUT" in
+    both)     ow=$'\033[91m*\033[0m' ;;
+    internal) oi=$'\033[91m*\033[0m' ;;
+    external) oe=$'\033[91m*\033[0m' ;;
+  esac
+
+  res=$(mon_prop "$EXTERNAL" width)x$(mon_prop "$EXTERNAL" height)
+  t=$(mon_prop "$EXTERNAL" transform); t=${t:-0}
+  rot=""
+  (( t % 2 == 1 )) && rot=", na vysku"
+
+  if (( HAS_INTERNAL )); then label="Notebook"; else label="Hlavni  "; fi
+  want="${SCALES[$SCALE_IDX]}"
+
+  printf '  \033[1mSprava obrazovek\033[0m\n'
+  printf '  %s: \033[36m%s\033[0m   Externi: \033[32m%s\033[0m \033[2m(%s%s)\033[0m\n' \
+         "$label" "$INTERNAL" "$EXTERNAL" "$res" "$rot"
+  if (( ${#EXTERNALS[@]} > 1 )); then
+    printf '  \033[2mExternich pripojeno: %d - klavesa e prepina\033[0m\n' "${#EXTERNALS[@]}"
+  else
+    printf '\n'
+  fi
+  printf '\n'
+
+  printf '  Obrazovky (o):  (%s) oba   (%s) jen %s   (%s) jen externi\n\n' \
+         "$ow" "$oi" "$( (( HAS_INTERNAL )) && echo notebook || echo hlavni )" "$oe"
+
+  if [[ $OUTPUT == both ]]; then
+    printf '  Rezim (Tab):\n'
+    printf '    %s Mirror   (stejny obraz na obou)\n'  "$mm"
+    printf '    %s Extend   (jedna velka plocha)\n\n'  "$em"
+  else
+    printf '\n\n\n\n'
+  fi
+
+  if [[ $MODE == extend && $OUTPUT == both ]]; then
+    printf '  Umisteni externiho monitoru (sipky):\n'
+    printf '            (%s) nahore\n'                  "$au"
+    printf '    (%s) vlevo  [%s]  (%s) vpravo\n'        "$al" "$( (( HAS_INTERNAL )) && echo notebook || echo "hlavni  " )" "$ar"
+    printf '            (%s) dole\n\n'                  "$ad"
+  else
+    printf '\n\n\n\n'
+  fi
+
+  if [[ $want == "$ESCALE" ]]; then
+    printf '  Skalovani externiho (s): \033[33m%sx\033[0m\n' "$ESCALE"
+  else
+    printf '  Skalovani externiho (s): \033[33m%sx\033[0m \033[2m(zvoleno %sx)\033[0m\n' "$ESCALE" "$want"
+  fi
+  printf '  \033[2m1 = nativni velikost, 2 = vse dvakrat vetsi (HiDPI)\033[0m\n\n'
+
+  if [[ -n $STATUS ]]; then
+    printf '  \033[31m%s\033[0m\n\n' "$STATUS"
+  elif [[ -n $NOTE ]]; then
+    printf '  \033[33m%s\033[0m\n\n' "$NOTE"
+  else
+    printf '\n\n'
+  fi
+
+  printf '  \033[32mTab\033[0m\033[2m rezim  \033[0m\033[32msipky\033[0m\033[2m strana  \033[0m\033[32ms\033[0m\033[2m scale  \033[0m\033[32mo\033[0m\033[2m obrazovky  \033[0m\033[32me\033[0m\033[2m dalsi  \033[0m\033[32mr\033[0m\033[2m reload  \033[0m\033[32mq\033[0m\033[2m konec\033[0m\n'
+}
+
+# --- start --------------------------------------------------------------------
+detect_monitors
+
+if [[ -z $INTERNAL && -z $EXTERNAL ]]; then
+  echo "Nenalezen zadny vystup."
+  exit 1
+fi
+
+if [[ -z $EXTERNAL ]]; then
+  echo "Neni pripojen zadny externi monitor."
+  echo "Nalezene vystupy: $(hyprctl monitors -j | jq -r '[.[].name] | join(", ")')"
+  exit 0
+fi
+
+read_state
+
+cleanup() { printf '\033[?25h'; clear; }
+trap cleanup EXIT
+printf '\033[?25l'   # skryt kurzor
+
+draw   # POZOR: zamerne bez apply - spusteni programu nic neprepina
+
+while true; do
+  IFS= read -rsn1 key || break
+  if [[ $key == $'\x1b' ]]; then
+    rest=""
+    read -rsn2 -t 0.1 rest 2>/dev/null || true
+    key+="$rest"
+    [[ $key == $'\x1b' ]] && continue    # samotny Esc = nic
+  fi
+  case "$key" in
+    $'\t')     if [[ $OUTPUT == both ]]; then
+                 [[ $MODE == mirror ]] && MODE="extend" || MODE="mirror"
+                 apply
+               fi ;;
+    $'\x1b[C') OUTPUT="both"; MODE="extend"; DIR="right"; apply ;;
+    $'\x1b[D') OUTPUT="both"; MODE="extend"; DIR="left";  apply ;;
+    $'\x1b[A') OUTPUT="both"; MODE="extend"; DIR="up";    apply ;;
+    $'\x1b[B') OUTPUT="both"; MODE="extend"; DIR="down";  apply ;;
+    s|S)       cycle_scale; apply ;;
+    o|O)       case "$OUTPUT" in
+                 both)     OUTPUT="internal" ;;
+                 internal) OUTPUT="external" ;;
+                 external) OUTPUT="both" ;;
+               esac
+               apply ;;
+    e|E)       if (( ${#EXTERNALS[@]} > 1 )); then
+                 EXT_IDX=$(( (EXT_IDX + 1) % ${#EXTERNALS[@]} ))
+                 EXTERNAL="${EXTERNALS[$EXT_IDX]}"
+                 read_state
+               fi ;;
+    r|R)       reload_config ;;
+    q|Q)       break ;;
+    *)         continue ;;
+  esac
+  detect_monitors
+  draw
+done
