@@ -1,29 +1,68 @@
 #!/usr/bin/env bash
-# displays - TUI sprava externich monitoru pro Hyprland
+# displays - TUI sprava externich monitoru pro Wayland kompozitory
 #
-#   Tab      rezim        Mirror <-> Extend
+#   Tab      rezim        Mirror <-> Extend (jen Hyprland, viz WM_HAS_MIRROR)
 #   Sipky    v Extend     strana externiho monitoru (vlevo/vpravo/nahore/dole)
 #   s        skalovani externiho monitoru (1 / 1.25 / 1.5 / 2)
 #   o        ktere obrazovky sviti (oba / jen notebook / jen externi)
 #   e        prepnout na dalsi externi monitor (kdyz jich je vic)
-#   r        reset na vychozi rozlozeni z ~/.config/hypr/monitors.conf
+#   r        reset na vychozi rozlozeni z konfigurace kompozitoru
 #            (zapomene ulozeny stav popsany nize)
 #   q        konec
 #
 # Zmeny se aplikuji az na stisk klavesy - pouhe spusteni programu
 # nic neprepina.
 #
-# Kazde uspesne "apply" se zaroven uklada do
-# ~/.local/state/omarchy/displays/monitors.conf, ktery hyprland.conf
-# nacita hned po ~/.config/hypr/monitors.conf. Diky tomu posledni zvoleny
+# Podporovane kompozitory (autodetekce, viz detect_wm a blok "backendy"):
+#
+#   sway       - swaymsg; stav se uklada do ~/.local/state/displays/outputs.conf
+#                a includuje se na konci ~/.config/sway/config.
+#                Zrcadleni sway neumi (viz WM_HAS_MIRROR) - nabizi jen Extend.
+#   hypr-lua   - Hyprland s Lua konfiguraci (Omarchy 4 "Quattro" a novejsi);
+#                zive zmeny pres `hyprctl eval`, stav do monitors.lua
+#   hypr-conf  - Hyprland s klasickou hyprland.conf; `hyprctl keyword`,
+#                stav do monitors.conf
+#
+# Kazde uspesne "apply" se zaroven uklada do STATE_FILE, ktery konfigurace
+# kompozitoru nacita az za vychozimi pravidly. Diky tomu posledni zvoleny
 # layout (mirror/extend, strana, scale, zapnute/vypnute obrazovky) prezije
-# restart Hyprlandu i odpojeni notebooku - jinak by se pri kazdem startu
+# restart kompozitoru i odpojeni notebooku - jinak by se pri kazdem startu
 # pouzila jen vychozi pravidla (externi monitor "auto" = vpravo).
 
 set -uo pipefail
 
-command -v hyprctl >/dev/null || { echo "hyprctl nenalezen - vyzaduje Hyprland."; exit 1; }
-command -v jq >/dev/null || { echo "jq nenalezen - potreba pro cteni vystupu hyprctl."; exit 1; }
+command -v jq >/dev/null || { echo "jq nenalezen - potreba pro cteni vystupu kompozitoru."; exit 1; }
+
+# --- detekce kompozitoru ------------------------------------------------------
+# WM je jediny prepinac, na kterem zavisi cely backendovy blok nize.
+detect_wm() {
+  if [[ -n ${SWAYSOCK:-} ]] && command -v swaymsg >/dev/null 2>&1 &&
+     swaymsg -t get_version >/dev/null 2>&1; then
+    WM="sway"
+  elif command -v hyprctl >/dev/null 2>&1 && hyprctl version >/dev/null 2>&1; then
+    # Od Omarchy 4 (Quattro) je aktivni konfigurace hyprland.lua, ne
+    # hyprland.conf - a `hyprctl keyword` na ni selhava hlaskou
+    # "keyword can't work with non-legacy parsers. Use eval."
+    if [[ -f $HOME/.config/hypr/hyprland.lua ]]; then WM="hypr-lua"; else WM="hypr-conf"; fi
+  else
+    echo "Nenalezen podporovany kompozitor (Sway ani Hyprland)." >&2
+    echo "Sway vyzaduje swaymsg a bezici session, Hyprland hyprctl." >&2
+    exit 1
+  fi
+}
+detect_wm
+
+# Umi kompozitor zrcadlit obsah na dva vystupy?
+#
+# Sway ne: kazdy workspace patri prave jednomu vystupu (viz `swaymsg -t
+# get_workspaces`, pole "output"), takze dva vystupy nemohou ukazovat tentyz
+# obsah. Prekryv vystupu na stejnych souradnicich zrcadleni NENI - jen si
+# vzajemne lezou do souradnic. Nativni ekvivalent neexistuje; kdo mirror
+# potrebuje, spusti vedle tohohle programu wl-mirror (balik v repu extra).
+case "$WM" in
+  sway) WM_HAS_MIRROR=0 ;;
+  *)    WM_HAS_MIRROR=1 ;;
+esac
 
 SCALES=(1 1.25 1.5 2)
 SCALE_IDX=0     # co si preje uzivatel (index do SCALES)
@@ -32,28 +71,282 @@ ISCALE=1        # totez pro interni panel
 STATUS=""       # chyba (cervene)
 NOTE=""         # informace (zlute)
 
-# Kam se uklada posledni odeslany layout, aby prezil restart Hyprlandu
-# (viz komentar na zacatku souboru a persist_layout nize).
-STATE_DIR="$HOME/.local/state/omarchy/displays"
-STATE_FILE="$STATE_DIR/monitors.conf"
+# Kam se uklada posledni odeslany layout, aby prezil restart kompozitoru.
+# Hyprland si drzi historickou cestu s "omarchy", aby se drive zadratovany
+# radek v hyprland.conf/lua nerozesel s novou verzi skriptu.
+case "$WM" in
+  sway)      STATE_DIR="$HOME/.local/state/displays"
+             STATE_FILE="$STATE_DIR/outputs.conf" ;;
+  hypr-lua)  STATE_DIR="$HOME/.local/state/omarchy/displays"
+             STATE_FILE="$STATE_DIR/monitors.lua" ;;
+  hypr-conf) STATE_DIR="$HOME/.local/state/omarchy/displays"
+             STATE_FILE="$STATE_DIR/monitors.conf" ;;
+esac
 mkdir -p "$STATE_DIR"
 [[ -f $STATE_FILE ]] || : > "$STATE_FILE"
 
-declare -A PERSIST_MAP   # jmeno monitoru -> radek pravidla naposled odeslany hyprctl
+# Fronta pravidel pro jeden "apply". Drzi se poradi (RULE_ORDER), aby byl
+# vystup deterministicky a slo vse odeslat jednim volanim - kompozitor pak
+# nevidi mezistav s prekryvajicimi se monitory.
+declare -a RULE_ORDER=()
+declare -A RULE_MAP=()
 
-# Zadrati soubor s ulozenym layoutem do ~/.config/hypr/hyprland.conf, pokud
-# tam jeste neni (typicky prvni spusteni na novem stroji). Bez tohoto radku
-# by se STATE_FILE sice zapisoval, ale Hyprland by ho nikdy nenacetl a
-# ulozeny layout by se po restartu ztratil - presne bug, kvuli kteremu tahle
+# ==============================================================================
+# BACKENDY
+#
+# Zbytek skriptu pracuje s "rest-stringem" ve tvaru, ktery zna Hyprland:
+#   "preferred, <X>x<Y>, <scale>, transform, <0-7>"
+#   "preferred, auto, <scale>, mirror, <zdroj>, transform, <0-7>"
+#   "disable"
+# Kazdy backend si ho prelozi do sve syntaxe (viz parse_rule + *_rule_cmd).
+# ==============================================================================
+
+# --- normalizovany seznam monitoru --------------------------------------------
+# Vraci JSON pole ve tvaru, ktery pouziva Hyprland:
+#   name, width, height (netransformovane pixely), scale, transform (0-7),
+#   x, y, disabled (bool), mirrorOf
+wm_monitors_json() {
+  case "$WM" in
+    sway)
+      # sway hlasi rect uz logicky a otoceny -> rozmery bereme z current_mode.
+      # Vypnuty vystup ma current_mode null, proto zaloha z .modes.
+      swaymsg -t get_outputs -r 2>/dev/null | jq -c '
+        {"normal":0,"90":1,"180":2,"270":3,
+         "flipped":4,"flipped-90":5,"flipped-180":6,"flipped-270":7} as $tf
+        | [ .[]
+            | ( .current_mode
+                // ((.modes // []) | if length > 0 then max_by(.width * .height) else null end)
+                // {width: .rect.width, height: .rect.height} ) as $m
+            | { name:      .name,
+                width:     $m.width,
+                height:    $m.height,
+                scale:     (.scale // 1),
+                transform: ($tf[(.transform // "normal")] // 0),
+                x:         .rect.x,
+                y:         .rect.y,
+                disabled:  ((.active // false) | not),
+                mirrorOf:  "none" } ]'
+      ;;
+    *)
+      hyprctl monitors all -j 2>/dev/null
+      ;;
+  esac
+}
+
+# Snapshot monitoru. Cte se z nej pres mon_prop, ktere bezi v command
+# substitution (= subshell), takze cache musi plnit rodic explicitne -
+# jinak by se kompozitor volal desetkrat na jedno prekresleni.
+MON_JSON=""
+refresh_monitors() { MON_JSON=$(wm_monitors_json); }
+mon_json() {
+  [[ -n $MON_JSON ]] || MON_JSON=$(wm_monitors_json)
+  printf '%s' "$MON_JSON"
+}
+
+# --- prelozeni rest-stringu ---------------------------------------------------
+# Rozlozi rest-string do globalnich RULE_* promennych.
+parse_rule() {
+  local rest="$1"
+  RULE_DISABLE=0; RULE_MODE="preferred"; RULE_POS=""; RULE_SCALE=1
+  RULE_MIRROR=""; RULE_TRANSFORM=0
+
+  if [[ $rest == disable ]]; then RULE_DISABLE=1; return; fi
+
+  local -a parts
+  IFS=',' read -ra parts <<< "$rest"
+  local i
+  for i in "${!parts[@]}"; do
+    parts[$i]="${parts[$i]# }"; parts[$i]="${parts[$i]% }"
+  done
+
+  RULE_MODE="${parts[0]}"
+  RULE_POS="${parts[1]}"
+  RULE_SCALE="${parts[2]}"
+
+  local idx=3
+  if [[ ${parts[3]:-} == mirror ]]; then
+    RULE_MIRROR="${parts[4]}"
+    idx=5
+  fi
+  [[ ${parts[$idx]:-} == transform ]] && RULE_TRANSFORM="${parts[$((idx+1))]}"
+}
+
+# 0-7 -> nazev transformace, jak ji chce sway.
+sway_transform_name() {
+  case "${1:-0}" in
+    1) echo 90 ;;  2) echo 180 ;; 3) echo 270 ;;
+    4) echo flipped ;; 5) echo flipped-90 ;; 6) echo flipped-180 ;; 7) echo flipped-270 ;;
+    *) echo normal ;;
+  esac
+}
+
+# Jedno pravidlo jako prikaz pro `swaymsg` / radek do sway configu.
+# Rezim (mode) zamerne nenastavujeme - sway po zapnuti vybere preferovany sam.
+sway_rule_cmd() {
+  local name="$1"
+  parse_rule "$2"
+  if (( RULE_DISABLE )); then
+    printf 'output %s disable' "$name"
+    return
+  fi
+  local cmd="output $name enable"
+  if [[ -n $RULE_POS && $RULE_POS != auto ]]; then
+    cmd+=" pos ${RULE_POS%x*} ${RULE_POS#*x}"
+  fi
+  cmd+=" scale $RULE_SCALE transform $(sway_transform_name "$RULE_TRANSFORM")"
+  printf '%s' "$cmd"
+}
+
+# Lua retezcovy literal (dvojite uvozovky, escapovany \ a ").
+lua_str() {
+  local s="${1//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '"%s"' "$s"
+}
+
+# Volani hl.monitor({...}) - format pro hyprland.lua i pro `hyprctl eval`.
+lua_rule_cmd() {
+  local name="$1"
+  parse_rule "$2"
+  if (( RULE_DISABLE )); then
+    printf 'hl.monitor({ output = %s, disabled = true })' "$(lua_str "$name")"
+    return
+  fi
+  if [[ -n $RULE_MIRROR ]]; then
+    printf 'hl.monitor({ output = %s, mode = %s, position = %s, scale = %s, mirror = %s, transform = %s })' \
+      "$(lua_str "$name")" "$(lua_str "$RULE_MODE")" "$(lua_str "$RULE_POS")" \
+      "$RULE_SCALE" "$(lua_str "$RULE_MIRROR")" "$RULE_TRANSFORM"
+  else
+    printf 'hl.monitor({ output = %s, mode = %s, position = %s, scale = %s, transform = %s })' \
+      "$(lua_str "$name")" "$(lua_str "$RULE_MODE")" "$(lua_str "$RULE_POS")" \
+      "$RULE_SCALE" "$RULE_TRANSFORM"
+  fi
+}
+
+# --- odeslani layoutu do kompozitoru ------------------------------------------
+# swaymsg vraci chybu jako JSON pole [{"success":false,"error":"..."}] A zaroven
+# nenulovy navratovy kod. Do STATUS patri jen ta jedna veta - cely JSON by v
+# TUI zabral nekolik radku a rozhodil layout.
+sway_send() {
+  local out rc err
+  out=$(swaymsg -r -- "$1" 2>&1); rc=$?
+  err=$(printf '%s' "$out" |
+        jq -r 'if type=="array" then (.[] | select(.success == false) | .error) else empty end' 2>/dev/null |
+        head -1)
+  if [[ -n $err ]]; then
+    STATUS="$err"
+  elif (( rc != 0 )); then
+    STATUS="chyba: $(printf '%s' "$out" | tr '\n' ' ')"
+  fi
+  return 0
+}
+
+hypr_send() {
+  local out
+  if out=$(hyprctl "$@" 2>&1); then
+    [[ $out == ok ]] || STATUS="$out"
+  else
+    STATUS="chyba: $out"
+  fi
+}
+
+# Odesle celou frontu pravidel najednou a vyprazdni ji.
+#
+# Jedno spolecne volani je dulezite: pri posilani po jednom kompozitor vidi
+# mezistav, kde se monitory prekryvaji nebo jsou oba na 0x0. Hyprland na to
+# umi zareagovat hlaskou "Your monitor layout is set up incorrectly", i kdyz
+# vysledny stav je v poradku.
+wm_flush() {
+  (( ${#RULE_ORDER[@]} == 0 )) && return
+  local name parts=()
+  case "$WM" in
+    sway)
+      for name in "${RULE_ORDER[@]}"; do
+        parts+=("$(sway_rule_cmd "$name" "${RULE_MAP[$name]}")")
+      done
+      local IFS=';'
+      sway_send "${parts[*]}" ;;
+    hypr-lua)
+      for name in "${RULE_ORDER[@]}"; do
+        parts+=("$(lua_rule_cmd "$name" "${RULE_MAP[$name]}")")
+      done
+      hypr_send eval "$(printf '%s\n' "${parts[@]}")" ;;
+    hypr-conf)
+      # Legacy parser umi jen jedno pravidlo na volani.
+      for name in "${RULE_ORDER[@]}"; do
+        hypr_send keyword monitor "$name, ${RULE_MAP[$name]}"
+      done ;;
+  esac
+}
+
+# --- perzistence --------------------------------------------------------------
+wm_state_header() {
+  case "$WM" in
+    hypr-lua) printf -- '-- %s\n' "$@" ;;
+    *)        printf -- '# %s\n'  "$@" ;;
+  esac
+}
+
+wm_state_line() {
+  case "$WM" in
+    sway)      sway_rule_cmd "$1" "$2"; printf '\n' ;;
+    hypr-lua)  lua_rule_cmd  "$1" "$2"; printf '\n' ;;
+    hypr-conf) printf 'monitor = %s, %s\n' "$1" "$2" ;;
+  esac
+}
+
+wm_reload() {
+  case "$WM" in
+    sway) sway_send reload ;;
+    *)    hypr_send reload ;;
+  esac
+}
+
+wm_config_name() {
+  case "$WM" in
+    sway)      echo "~/.config/sway/config" ;;
+    hypr-lua)  echo "~/.config/hypr/monitors.lua" ;;
+    hypr-conf) echo "~/.config/hypr/monitors.conf" ;;
+  esac
+}
+
+# Zadrati soubor s ulozenym layoutem do konfigurace kompozitoru, pokud tam
+# jeste neni (typicky prvni spusteni na novem stroji). Bez tohoto radku by se
+# STATE_FILE sice zapisoval, ale kompozitor by ho nikdy nenacetl a ulozeny
+# layout by se po restartu ztratil - presne bug, kvuli kteremu tahle
 # perzistence vznikla. Idempotentni, se zalohou puvodniho souboru.
 ensure_persistence_wired() {
+  case "$WM" in
+    sway)      wire_sway ;;
+    hypr-lua)  wire_hypr_lua ;;
+    hypr-conf) wire_hypr_conf ;;
+  esac
+}
+
+wire_sway() {
+  local cfg="$HOME/.config/sway/config"
+  local inc="include ~/.local/state/displays/outputs.conf"
+
+  [[ -f $cfg ]] || return
+  grep -qF 'displays/outputs.conf' "$cfg" && return
+
+  cp "$cfg" "$cfg.bak.$(date +%s)"
+  # Na konec souboru: ve sway vyhrava posledni `output` pravidlo pro dany
+  # vystup, takze ulozeny layout musi prijit az za vychozi konfiguraci.
+  printf '\n# Ulozeny layout z programu "displays"\n%s\n' "$inc" >> "$cfg"
+
+  wm_reload
+  NOTE="Prvni spusteni: do sway configu pridan include pro ukladani layoutu (zaloha: config.bak.*)"
+}
+
+wire_hypr_conf() {
   local hypr_conf="$HOME/.config/hypr/hyprland.conf"
   local state_rel="~/.local/state/omarchy/displays/monitors.conf"
   local anchor='source = ~/.config/hypr/monitors.conf'
   local src_line="source = $state_rel"
 
-  [[ -f $hypr_conf ]] || return   # zadny Hyprland config tady - neni co delat
-  grep -qF "$state_rel" "$hypr_conf" && return   # uz zadratovano
+  [[ -f $hypr_conf ]] || return
+  grep -qF "$state_rel" "$hypr_conf" && return
 
   cp "$hypr_conf" "$hypr_conf.bak.$(date +%s)"
 
@@ -67,9 +360,46 @@ ensure_persistence_wired() {
     printf '\n# Ulozeny layout z programu "displays"\n%s\n' "$src_line" >> "$hypr_conf"
   fi
 
-  hyprctl reload >/dev/null 2>&1
+  wm_reload
   NOTE="Prvni spusteni: do hyprland.conf pridan radek pro ukladani layoutu (zaloha: $(basename "$hypr_conf").bak.*)"
 }
+
+# dofile misto require: require by soubor po prvnim nacteni cachoval a
+# dalsi "hyprctl reload" by uz zmeny v STATE_FILE ignoroval.
+wire_hypr_lua() {
+  local hypr_lua="$HOME/.config/hypr/hyprland.lua"
+  local state_path='os.getenv("HOME") .. "/.local/state/omarchy/displays/monitors.lua"'
+  local anchor='require("hypr.monitors")'
+  local dofile_block
+  dofile_block=$(printf '%s\n%s\n%s\n%s\n' \
+    'do' \
+    "  local __displays_state = $state_path" \
+    '  if io.open(__displays_state) then dofile(__displays_state) end' \
+    'end')
+
+  [[ -f $hypr_lua ]] || return
+  grep -qF 'omarchy/displays/monitors.lua' "$hypr_lua" && return
+
+  cp "$hypr_lua" "$hypr_lua.bak.$(date +%s)"
+
+  if grep -qF "$anchor" "$hypr_lua"; then
+    # Vlozit hned za require("hypr.monitors"), aby ulozeny layout mel
+    # prednost pred vychozimi pravidly (pozdejsi hl.monitor pro stejny
+    # output vyhrava).
+    awk -v anchor="$anchor" -v block="$dofile_block" \
+      '{ print } index($0, anchor) { print block }' \
+      "$hypr_lua" > "$hypr_lua.tmp" && mv "$hypr_lua.tmp" "$hypr_lua"
+  else
+    printf '\n-- Ulozeny layout z programu "displays"\n%s\n' "$dofile_block" >> "$hypr_lua"
+  fi
+
+  wm_reload
+  NOTE="Prvni spusteni: do hyprland.lua pridan blok pro ukladani layoutu (zaloha: $(basename "$hypr_lua").bak.*)"
+}
+
+# ==============================================================================
+# SPOLECNA CAST - detekce monitoru, matematika layoutu, TUI
+# ==============================================================================
 
 # --- detekce monitoru ---------------------------------------------------------
 # Fyzicky pripojene konektory podle jadra (autoritativni zdroj).
@@ -86,16 +416,18 @@ connected_outputs() {
 
 # Seznam obrazovek, se kterymi se da pracovat.
 #
-# `hyprctl monitors` sam nestaci: zrcadleny nebo vypnuty vystup v nem
-# vubec neni (zmizel by uprostred prace). `monitors all` zase vraci i
-# konektory, ktere uz nejsou zapojene. Bereme tedy prunik obou -
-# vystupy, ktere Hyprland zna A ktere jsou skutecne pripojene.
+# Samotny seznam z kompozitoru nestaci: Hyprland v `monitors` neukazuje
+# zrcadleny ani vypnuty vystup (zmizel by uprostred prace), zatimco
+# `monitors all` / sway `get_outputs` vraci i konektory, ktere uz nejsou
+# zapojene. Bereme tedy prunik obou - vystupy, ktere kompozitor zna A ktere
+# jsou skutecne pripojene.
 #
 # Interni panel = eDP-*/LVDS-*/DSI-*, vse ostatni je externi. Zadny port
 # neni natvrdo, funguje DP, HDMI i USB-C dok.
 detect_monitors() {
+  refresh_monitors
   local known drm candidates n d found
-  mapfile -t known < <(hyprctl monitors all -j 2>/dev/null | jq -r '.[].name')
+  mapfile -t known < <(mon_json | jq -r '.[].name')
   mapfile -t drm   < <(connected_outputs)
 
   candidates=()
@@ -109,7 +441,7 @@ detect_monitors() {
       (( found )) && candidates+=("$n")
     done
   fi
-  # /sys/class/drm nedostupne (jina grafika, VM) -> spolehni se na Hyprland
+  # /sys/class/drm nedostupne (jina grafika, VM) -> spolehni se na kompozitor
   (( ${#candidates[@]} == 0 )) && candidates=("${known[@]:-}")
 
   INTERNAL=""
@@ -125,7 +457,7 @@ detect_monitors() {
   # Zadny interni panel (stolni pocitac, neznamy nazev panelu): za "hlavni"
   # obrazovku vezmeme prvni nalezenou. Bez toho by INTERNAL zustalo prazdne
   # a pravidlo `monitor = , ...` je pro Hyprland WILDCARD pro vsechny
-  # monitory - prepsalo by naraz celou konfiguraci.
+  # monitory (a `output *` totez ve sway) - prepsalo by naraz celou konfiguraci.
   HAS_INTERNAL=1
   if [[ -z $INTERNAL ]] && (( ${#EXTERNALS[@]} > 0 )); then
     HAS_INTERNAL=0
@@ -138,16 +470,16 @@ detect_monitors() {
   EXTERNAL="${EXTERNALS[$EXT_IDX]:-}"
 }
 
-# Vlastnost monitoru z hyprctl (i kdyz je prave vypnuty).
+# Vlastnost monitoru z kompozitoru (i kdyz je prave vypnuty).
 mon_prop() {
   [[ -z ${1:-} ]] && return
   # Pozn.: `// empty` zde nelze - v jq je `false` falsy a hodnota
   # .disabled == false by se ztratila.
-  hyprctl monitors all -j 2>/dev/null |
+  mon_json |
     jq -r --arg m "$1" --arg p "$2" '.[] | select(.name==$m) | .[$p] | select(. != null)'
 }
 
-# 2.00 -> 2, 1.250 -> 1.25 (Hyprland vraci scale s desetinami nulami)
+# 2.00 -> 2, 1.250 -> 1.25 (kompozitor vraci scale s desetinami nulami)
 fmt_scale() {
   [[ -z ${1:-} ]] && return
   awk -v s="$1" 'BEGIN { printf (s == int(s)) ? "%d\n" : "%g\n", s }'
@@ -161,8 +493,8 @@ cur_scale() {
 
 # Rozmery panelu s ohledem na rotaci.
 #
-# hyprctl hlasi width/height VZDY netransformovane - u monitoru na vysku
-# (transform 1/3/5/7 = 90/270 stupnu, pripadne prevracene) tedy vrati
+# width/height jsou VZDY netransformovane - u monitoru na vysku
+# (transform 1/3/5/7 = 90/270 stupnu, pripadne prevracene) tedy vratime
 # 1920x1080, i kdyz plocha je ve skutecnosti 1080x1920. Prohodime sami.
 oriented_size() {
   local name="$1" w h t
@@ -180,14 +512,15 @@ logical_size() {
   awk -v w="$w" -v h="$h" -v s="$scale" 'BEGIN { printf "%d %d\n", int(w/s+0.5), int(h/s+0.5) }'
 }
 
-# Nejblizsi skalovani, ktere Hyprland na danem monitoru skutecne prijme.
+# Nejblizsi skalovani, ktere kompozitor na danem monitoru skutecne prijme.
 #
 # Hyprland vyzaduje, aby rozliseni deleno scale vyslo na cele pixely. Kdyz
 # nevyjde (napr. 2560x1440 pri 1.5), hodnotu si POTICHU upravi a `hyprctl
 # keyword` presto vrati "ok" - pozice sousedniho monitoru pocitane z puvodni
-# hodnoty pak nesedi a v layoutu zustane mezera nebo prekryv. Hledame proto
-# pouzitelnou hodnotu sami, po krocich 1/120 (granularita wayland scale),
-# a smerem nahoru driv nez dolu - stejne jako to dela Hyprland.
+# hodnoty pak nesedi a v layoutu zustane mezera nebo prekryv. Sway sice
+# libovolny scale prijme, ale logicky rozmer zaokrouhli, takze vznikne
+# stejna mezera. Hledame proto pouzitelnou hodnotu sami, po krocich 1/120
+# (granularita wayland scale), a smerem nahoru driv nez dolu.
 snap_scale() {
   local name="$1" want="$2" w h
   read -r w h < <(oriented_size "$name")
@@ -227,6 +560,7 @@ nearest_scale_idx() {
 
 # --- nacteni aktualniho stavu (bez zasahu do konfigurace) ---------------------
 read_state() {
+  refresh_monitors
   MODE="extend"; DIR="right"; OUTPUT="both"
 
   local ext_disabled int_disabled mirror_of s ex ey ix iy
@@ -239,10 +573,18 @@ read_state() {
     OUTPUT="external"
   fi
 
+  ex=$(mon_prop "$EXTERNAL" x); ey=$(mon_prop "$EXTERNAL" y)
+  ix=$(mon_prop "$INTERNAL" x); iy=$(mon_prop "$INTERNAL" y)
+
+  # Jen kompozitory se skutecnym zrcadlenim hlasi mirrorOf; ve sway zustane
+  # MODE vzdy "extend".
   mirror_of=$(mon_prop "$EXTERNAL" mirrorOf)
   [[ -n $mirror_of && $mirror_of != none ]] && MODE="mirror"
 
-  ISCALE=$(cur_scale "$INTERNAL")
+  # Vypnuty vystup hlasi ve sway scale null (cur_scale by vratilo 1) - drz
+  # posledni znamou hodnotu, jinak by se scale panelu ztratil pri kazde ceste
+  # pres "jen externi". U ESCALE to resi uz podminka [[ -n $s ]] nize.
+  [[ $int_disabled == true ]] || ISCALE=$(cur_scale "$INTERNAL")
   s=$(fmt_scale "$(mon_prop "$EXTERNAL" scale)")
   if [[ -n $s ]]; then
     ESCALE="$s"
@@ -251,8 +593,6 @@ read_state() {
 
   # Strana odvozena z aktualnich souradnic.
   if [[ $MODE == extend && $OUTPUT == both ]]; then
-    ex=$(mon_prop "$EXTERNAL" x); ey=$(mon_prop "$EXTERNAL" y)
-    ix=$(mon_prop "$INTERNAL" x); iy=$(mon_prop "$INTERNAL" y)
     if [[ -n $ex && -n $ix ]]; then
       if   (( ex >= ix )) && (( ${ey:-0} == ${iy:-0} )); then DIR="right"
       elif (( ex <  ix )) && (( ${ey:-0} == ${iy:-0} )); then DIR="left"
@@ -264,35 +604,29 @@ read_state() {
 }
 
 # --- aplikace nastaveni -------------------------------------------------------
-hypr() {
-  local out
-  if out=$(hyprctl keyword "$@" 2>&1); then
-    [[ $out == ok ]] || STATUS="$out"
-  else
-    STATUS="chyba: $out"
-  fi
-}
-
-# Jedno pravidlo pro jeden monitor. Prazdne jmeno je v Hyprlandu wildcard
-# pro vsechny monitory - nikdy ho neposilat.
-hypr_mon() {
+# Jedno pravidlo pro jeden monitor - jen se zaradi do fronty, neposila se
+# hned (viz wm_flush). Prazdne jmeno je wildcard pro vsechny monitory -
+# nikdy ho neposilat.
+queue_rule() {
   local name="$1" rest="$2"
   [[ -z $name ]] && { STATUS="interni chyba: prazdne jmeno monitoru"; return 1; }
-  hypr monitor "$name, $rest"
-  PERSIST_MAP["$name"]="$rest"
+  [[ -n ${RULE_MAP[$name]:-} ]] || RULE_ORDER+=("$name")
+  RULE_MAP["$name"]="$rest"
 }
 
-# Zapise naposledy odeslany layout (viz PERSIST_MAP naplneny pres hypr_mon)
-# do STATE_FILE, ktery hyprland.conf nacita hned po ~/.config/hypr/monitors.conf.
-# Volat az PO push_layout, aby soubor odpovidal tomu, co skutecne bezi.
+# Zapise naposledy odeslany layout (viz fronta naplnena pres queue_rule) do
+# STATE_FILE, ktery konfigurace kompozitoru nacita az za vychozimi pravidly.
+# Volat az PO wm_flush, aby soubor odpovidal tomu, co skutecne bezi.
 persist_layout() {
-  local name
+  local name cfg
+  cfg=$(wm_config_name)
   {
-    printf '# Autogenerovano programem "displays" - needit rucne.\n'
-    printf '# Posledni rozlozeni monitoru zvolene v TUI. Klavesa "r" v displays\n'
-    printf '# tento soubor vyprazdni a vrati layout na ~/.config/hypr/monitors.conf.\n'
-    for name in "${!PERSIST_MAP[@]}"; do
-      printf 'monitor = %s, %s\n' "$name" "${PERSIST_MAP[$name]}"
+    wm_state_header \
+      'Autogenerovano programem "displays" - needit rucne.' \
+      'Posledni rozlozeni monitoru zvolene v TUI. Klavesa "r" v displays' \
+      "tento soubor vyprazdni a vrati layout na $cfg."
+    for name in "${RULE_ORDER[@]}"; do
+      wm_state_line "$name" "${RULE_MAP[$name]}"
     done
   } > "$STATE_FILE"
 }
@@ -303,40 +637,41 @@ persist_layout() {
 place() {
   local name="$1" x="$2" y="$3" s="$4" t
   t=$(mon_prop "$name" transform); t=${t:-0}
-  hypr_mon "$name" "preferred, ${x}x${y}, $s, transform, $t"
+  queue_rule "$name" "preferred, ${x}x${y}, $s, transform, $t"
 }
 
+# Volat jen kdyz (( WM_HAS_MIRROR )) - push_layout to hlida.
 mirror_to() {
   local name="$1" src="$2" s="$3" t
   t=$(mon_prop "$name" transform); t=${t:-0}
-  hypr_mon "$name" "preferred, auto, $s, mirror, $src, transform, $t"
+  queue_rule "$name" "preferred, auto, $s, mirror, $src, transform, $t"
 }
 
 # Posle cely layout podle aktualniho OUTPUT/MODE/DIR. Pracuje s globalnimi
-# ISCALE/ESCALE, ktere uz jsou snapnute na hodnoty prijatelne pro Hyprland.
+# ISCALE/ESCALE, ktere uz jsou snapnute na prijatelne hodnoty.
 push_layout() {
   local iw ih ew eh ow oh os edge n
 
-  PERSIST_MAP=()   # vzdy odrazi jen posledni volani, ne soucet napric apply()
+  RULE_ORDER=(); RULE_MAP=()   # vzdy odrazi jen posledni volani, ne soucet napric apply()
 
   case "$OUTPUT" in
     internal)
       place "$INTERNAL" 0 0 "$ISCALE"
       for n in "${EXTERNALS[@]:-}"; do
-        [[ -n $n ]] && hypr_mon "$n" "disable"
+        [[ -n $n ]] && queue_rule "$n" "disable"
       done
       return ;;
     external)
       place "$EXTERNAL" 0 0 "$ESCALE"
-      hypr_mon "$INTERNAL" "disable"
+      queue_rule "$INTERNAL" "disable"
       for n in "${EXTERNALS[@]:-}"; do
-        [[ -n $n && $n != "$EXTERNAL" ]] && hypr_mon "$n" "disable"
+        [[ -n $n && $n != "$EXTERNAL" ]] && queue_rule "$n" "disable"
       done
       return ;;
   esac
 
   # OUTPUT=both -> vse zapnout
-  if [[ $MODE == mirror ]]; then
+  if [[ $MODE == mirror ]] && (( WM_HAS_MIRROR )); then
     place "$INTERNAL" 0 0 "$ISCALE"
     for n in "${EXTERNALS[@]:-}"; do
       [[ -z $n ]] && continue
@@ -382,12 +717,13 @@ push_layout() {
   done
 }
 
-# Pocka, az se na monitoru projevi ocekavane skalovani (Hyprland meni rezim
-# asynchronne). Vrati nenulu, kdyz se do ~0.6 s neshoduje.
+# Pocka, az se na monitoru projevi ocekavane skalovani (kompozitor meni
+# rezim asynchronne). Vrati nenulu, kdyz se do ~0.6 s neshoduje.
 settle() {
   local i
   for i in 1 2 3 4 5 6; do
     sleep 0.1
+    refresh_monitors
     [[ $(cur_scale "$1") == "$2" ]] && return 0
   done
   return 1
@@ -401,18 +737,25 @@ apply() {
   fi
 
   local want="${SCALES[$SCALE_IDX]}"
-  ISCALE=$(snap_scale "$INTERNAL" "$(cur_scale "$INTERNAL")")
+  # Viz read_state: z vypnuteho vystupu se scale precist neda, drzime posledni
+  # znamou hodnotu ISCALE.
+  [[ $(mon_prop "$INTERNAL" disabled) == true ]] || ISCALE=$(cur_scale "$INTERNAL")
+  ISCALE=$(snap_scale "$INTERNAL" "$ISCALE")
   ESCALE=$(snap_scale "$EXTERNAL" "$want")
 
   push_layout
+  wm_flush
+  refresh_monitors
 
-  # Pojistka pro pripad, ze by si Hyprland scale presto upravil (jina verze,
-  # jina heuristika): precteme skutecny stav a layout posleme jeste jednou,
-  # uz se spravnymi cisly.
+  # Pojistka pro pripad, ze by si kompozitor scale presto upravil (jina
+  # verze, jina heuristika): precteme skutecny stav a layout posleme jeste
+  # jednou, uz se spravnymi cisly.
   if [[ $OUTPUT != internal ]] && ! settle "$EXTERNAL" "$ESCALE"; then
-    ESCALE=$(cur_scale "$EXTERNAL")
-    ISCALE=$(cur_scale "$INTERNAL")
+    [[ $(mon_prop "$EXTERNAL" disabled) == true ]] || ESCALE=$(cur_scale "$EXTERNAL")
+    [[ $(mon_prop "$INTERNAL" disabled) == true ]] || ISCALE=$(cur_scale "$INTERNAL")
     push_layout
+    wm_flush
+    refresh_monitors
   fi
 
   persist_layout
@@ -424,14 +767,13 @@ apply() {
 
 reload_config() {
   STATUS=""; NOTE=""
-  local out
-  # Zapomenout ulozeny layout - jinak by ho hyprland.conf hned zase nacetl
+  # Zapomenout ulozeny layout - jinak by ho konfigurace hned zase nacetla
   # a "r" by fakticky nic neresetovalo.
-  printf '# Autogenerovano programem "displays" - needit rucne.\n' > "$STATE_FILE"
-  out=$(hyprctl reload 2>&1) || STATUS="chyba: $out"
+  wm_state_header 'Autogenerovano programem "displays" - needit rucne.' > "$STATE_FILE"
+  wm_reload
   detect_monitors
   read_state
-  [[ -z $STATUS ]] && NOTE="Nacteno z ~/.config/hypr/monitors.conf (ulozeny stav zapomenut)"
+  [[ -z $STATUS ]] && NOTE="Nacteno z $(wm_config_name) (ulozeny stav zapomenut)"
 }
 
 cycle_scale() {
@@ -440,6 +782,7 @@ cycle_scale() {
 
 # --- vykresleni ---------------------------------------------------------------
 draw() {
+  refresh_monitors
   clear
   local mm em ar al au ad ow oi oe res t rot label want
 
@@ -468,7 +811,7 @@ draw() {
   if (( HAS_INTERNAL )); then label="Notebook"; else label="Hlavni  "; fi
   want="${SCALES[$SCALE_IDX]}"
 
-  printf '  \033[1mSprava obrazovek\033[0m\n'
+  printf '  \033[1mSprava obrazovek\033[0m \033[2m(%s)\033[0m\n' "$WM"
   printf '  %s: \033[36m%s\033[0m   Externi: \033[32m%s\033[0m \033[2m(%s%s)\033[0m\n' \
          "$label" "$INTERNAL" "$EXTERNAL" "$res" "$rot"
   if (( ${#EXTERNALS[@]} > 1 )); then
@@ -483,7 +826,11 @@ draw() {
 
   if [[ $OUTPUT == both ]]; then
     printf '  Rezim (Tab):\n'
-    printf '    %s Mirror   (stejny obraz na obou)\n'  "$mm"
+    if (( WM_HAS_MIRROR )); then
+      printf '    %s Mirror   (stejny obraz na obou)\n'  "$mm"
+    else
+      printf '    \033[2m--- Mirror   (sway zrcadleni neumi)\033[0m\n'
+    fi
     printf '    %s Extend   (jedna velka plocha)\n\n'  "$em"
   else
     printf '\n\n\n\n'
@@ -526,7 +873,7 @@ fi
 
 if [[ -z $EXTERNAL ]]; then
   echo "Neni pripojen zadny externi monitor."
-  echo "Nalezene vystupy: $(hyprctl monitors -j | jq -r '[.[].name] | join(", ")')"
+  echo "Nalezene vystupy: $(mon_json | jq -r '[.[] | select(.disabled != true) | .name] | join(", ")')"
   exit 0
 fi
 
@@ -549,8 +896,13 @@ while true; do
   fi
   case "$key" in
     $'\t')     if [[ $OUTPUT == both ]]; then
-                 [[ $MODE == mirror ]] && MODE="extend" || MODE="mirror"
-                 apply
+                 if (( WM_HAS_MIRROR )); then
+                   [[ $MODE == mirror ]] && MODE="extend" || MODE="mirror"
+                   apply
+                 else
+                   STATUS=""
+                   NOTE="Sway zrcadleni neumi - kazdy workspace patri jednomu vystupu (viz README)"
+                 fi
                fi ;;
     $'\x1b[C') OUTPUT="both"; MODE="extend"; DIR="right"; apply ;;
     $'\x1b[D') OUTPUT="both"; MODE="extend"; DIR="left";  apply ;;
