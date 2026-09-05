@@ -7,12 +7,12 @@ Terminal UI for managing external monitor layout on **Sway** and **Hyprland** â€
 [![License](https://img.shields.io/badge/license-MIT-yellow)](https://opensource.org/license/MIT)
 [![Stars](https://img.shields.io/github/stars/Luquas95/displays?style=social)](https://github.com/Luquas95/displays)
 
-![displays on Sway](docs/screenshot.png)
+![displays running on Sway](docs/screenshot.png)
 
 <details>
 <summary>On Hyprland, where Mirror is available</summary>
 
-![displays on Hyprland](docs/screenshot-mirror.png)
+![displays running on Hyprland, where Mirror is available](docs/screenshot-mirror.png)
 
 </details>
 
